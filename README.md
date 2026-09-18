@@ -23,7 +23,7 @@ of USB communication
 
 ## Posible next steps
 
-An OTP generator that enters the OTP when a certain keychord is pressed
+An OTP generator that "types" the OTP when a certain keychord is pressed
 
 <img width="917" height="517" alt="image" src="https://github.com/user-attachments/assets/751d0d05-da04-414d-832c-db4533ee16ae" />
 
