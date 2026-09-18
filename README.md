@@ -25,5 +25,8 @@ of USB communication
 
 An OTP generator that "types" the OTP when a certain keychord is pressed
 
+Send a certain keycode on switch so it can be used in the computer
+switched to to select its input in a monitor using ddcutil, for example
+
 <img width="917" height="517" alt="image" src="https://github.com/user-attachments/assets/751d0d05-da04-414d-832c-db4533ee16ae" />
 
