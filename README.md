@@ -26,3 +26,5 @@ of USB communication
 Smart keycard: An OTP generator that sends a preconfigured OTP on a
 certain keychord
 
+<img width="917" height="517" alt="image" src="https://github.com/user-attachments/assets/751d0d05-da04-414d-832c-db4533ee16ae" />
+
