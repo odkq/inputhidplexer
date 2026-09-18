@@ -21,10 +21,9 @@ Code. Debugging and several reflashing and trial/error was needed but
 the model showed expertise in the Arduino libraries and in the subtleties
 of USB communication
 
-## Posible addons
+## Posible next steps
 
-Smart keycard: An OTP generator that sends a preconfigured OTP on a
-certain keychord
+An OTP generator that enters the OTP when a certain keychord is pressed
 
 <img width="917" height="517" alt="image" src="https://github.com/user-attachments/assets/751d0d05-da04-414d-832c-db4533ee16ae" />
 
