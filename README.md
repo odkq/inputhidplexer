@@ -1,4 +1,4 @@
-# keyplexer. Keyboard (and mouse) instantaneous multiplexer
+# inputhidplexer. Keyboard (and mouse) instantaneous multiplexer
 
 Previously I used a usb switch to share a keyboard and mouse (Tex Shura)
 between two computers. This had some drawbacks:
