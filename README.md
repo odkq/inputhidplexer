@@ -1,6 +1,6 @@
 # keyplexer. Keyboard (and mouse) instantaneous multiplexer
 
-Before, I used a usb switch to share a keyboard and mouse (Tex Shura)
+Previously I used a usb switch to share a keyboard and mouse (Tex Shura)
 between two computers. This had some drawbacks:
 
 - Slow, as the keyboard is reinitialized each time you switch
