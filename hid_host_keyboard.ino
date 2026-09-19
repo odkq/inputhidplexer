@@ -1,9 +1,9 @@
 /*
  * USB HID host -> raw serial forwarding, dual-channel with keyboard toggle
  *
- * Pico (arduino-pico, Earle Philhower core) as a USB host for HID devices
- * (keyboard with media keys, mouse, combo receiver, ...) through a micro-USB
- * OTG cable. Forwards EVERY raw HID report, untranslated, over serial.
+ * Pico (arduino-pico, Earle Philhower core) as a USB host for the TeX Shura
+ * USB keyboard (with its media keys and mouse) through a micro-USB OTG cable.
+ * Forwards EVERY raw HID report, untranslated, over serial.
  *
  * Output protocol (binary, raw HID report verbatim):
  *   0x81 <inst> <len> <b0>...<b{len-1}>   STX  dispatch  len  payload
@@ -19,12 +19,12 @@
  * combined with any other key (e.g. R-Ctrl+C) is not a switch: it is a
  * normal chord and is forwarded unchanged.
  *
- * The Holtek combo receiver (04d9:0532) ONLY streams its mouse/consumer/
- * system reports (IDs 0x03/0x02/0x01 on the multi-collection interface) in
- * REPORT protocol; TinyUSB's default BOOT protocol silences it, so we force
- * report protocol (tuh_hid_set_default_protocol). Mass Storage host is
- * disabled in the library config (CFG_TUH_MSC=0): its endless SCSI probe
- * floods the bus and starves the HID interrupt endpoints.
+ * The Holtek controller (04d9:0532) inside the keyboard ONLY streams its
+ * mouse/consumer/system reports (IDs 0x03/0x02/0x01 on the multi-collection
+ * interface) in REPORT protocol; TinyUSB's default BOOT protocol silences
+ * it, so we force report protocol (tuh_hid_set_default_protocol). Mass
+ * Storage host is disabled in the library config (CFG_TUH_MSC=0): its
+ * endless SCSI probe floods the bus and starves the HID interrupt endpoints.
  *
  * Interrupt-IN receives are armed by a periodic loop pass after the device
  * is fully configured, never from the mount callback (issuing transfers
@@ -69,7 +69,7 @@ void setup() {
   Serial1.begin(115200);   // UART0, TX = GPIO0 -> receiver A
   Serial2.begin(115200);   // UART1, TX = GPIO4 -> receiver B
 
-  // The Holtek receiver only streams its mouse/consumer reports in REPORT
+  // The Holtek controller only streams its mouse/consumer reports in REPORT
   // protocol; TinyUSB defaults to BOOT, which silences it.
   tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
 
