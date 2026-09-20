@@ -39,7 +39,114 @@
 
 static const uint32_t BAUD = 115200;
 
+// ---------------------------------------------------------------------
+// OTP (TOTP typing). Only the receiver on the computer that needs the OTP
+// sets OTP_ENABLED=1; the other receiver keeps 0 = stock behavior.
+//   OTP_DIGITS   - token length typed (6 = RFC standard)
+//   OTP_DEFAULT_SECRET_B32 - fallback secret if EEPROM is unprovisioned
+//                            (RFC 4648 base32, A-Z2-7)
+//   Provision at runtime with  s <base32>  over ttyACM0 (CDC).
+//   Boot self-test verifies RFC 6238 vectors when OTP_SELFTEST=1.
+// ---------------------------------------------------------------------
+#define OTP_ENABLED 1
+#define OTP_DIGITS 6
+#define OTP_DEFAULT_SECRET_B32 "JBSWY3DPEHPK3PXP"
+#define OTP_SELFTEST 1
+
 #include <string.h>
+#if OTP_ENABLED
+#include <EEPROM.h>
+#include "totp.h"
+
+// --- secret storage (EEPROM: 'OTP' magic + len + raw bytes) ---
+static uint8_t otp_secret[20];
+static uint8_t otp_secret_len = 0;
+
+static void otp_use_default_secret(void) {
+  otp_secret_len = (uint8_t)base32_decode(OTP_DEFAULT_SECRET_B32,
+                     strlen(OTP_DEFAULT_SECRET_B32), otp_secret, sizeof(otp_secret));
+}
+
+static void otp_load_secret(void) {
+  if (EEPROM.read(0) == 'O' && EEPROM.read(1) == 'T' && EEPROM.read(2) == 'P') {
+    uint8_t n = EEPROM.read(3);
+    if (n >= 1 && n <= sizeof(otp_secret)) {
+      for (uint8_t i = 0; i < n; i++) otp_secret[i] = EEPROM.read(4 + i);
+      otp_secret_len = n;
+      Serial.print("OTP secret: EEPROM (");
+      Serial.print(otp_secret_len);
+      Serial.println(" bytes)");
+      return;
+    }
+  }
+  otp_use_default_secret();
+  Serial.print("OTP secret: default (");
+  Serial.print(otp_secret_len);
+  Serial.println(" bytes)");
+}
+
+static void otp_store_secret(const uint8_t *bytes, uint8_t n) {
+  EEPROM.write(0, 'O'); EEPROM.write(1, 'T'); EEPROM.write(2, 'P');
+  EEPROM.write(3, n);
+  for (uint8_t i = 0; i < n; i++) EEPROM.write(4 + i, bytes[i]);
+  for (uint8_t i = n; i < sizeof(otp_secret); i++) EEPROM.write(4 + i, 0);
+  memcpy(otp_secret, bytes, n);
+  otp_secret_len = n;
+  Serial.print("OTP secret: provisioned (");
+  Serial.print(n);
+  Serial.println(" bytes)");
+}
+
+// --- CDC command line:  s <base32>  -> provision secret to EEPROM ---
+static char otp_cmd[80];
+static uint8_t otp_cmd_len = 0;
+
+static void otp_service_cdc(void) {
+  while (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      if (otp_cmd_len > 0) {
+        otp_cmd[otp_cmd_len] = '\0';
+        char *p = otp_cmd + 1;               // skip command char
+        while (*p == ' ' || *p == '\t') p++;
+        uint8_t buf[sizeof(otp_secret)];
+        size_t n = base32_decode(p, strlen(p), buf, sizeof(buf));
+        if (n >= 1 && n <= sizeof(otp_secret)) {
+          otp_store_secret(buf, (uint8_t)n);
+        } else {
+          Serial.println("OTP secret: BAD base32");
+        }
+      }
+      otp_cmd_len = 0;
+    } else if (otp_cmd_len < sizeof(otp_cmd) - 1) {
+      otp_cmd[otp_cmd_len++] = ch;
+    }
+  }
+}
+
+// --- RFC 6238 known-answer self-test (SHA-1, 8-digit vectors) ---
+static void otp_selftest(void) {
+  const uint8_t secret[] = "12345678901234567890";
+  struct { uint64_t t; uint32_t want; } vec[] = {
+    { 59ULL,        94287082u },
+    { 1111111109ULL,  7081804u },
+    { 1111111111ULL, 14050471u },
+    { 1234567890ULL, 89005924u },
+    { 2000000000ULL, 69279037u },
+    { 20000000000ULL, 65353130u },
+  };
+  bool ok = true;
+  for (uint8_t i = 0; i < sizeof(vec) / sizeof(vec[0]); i++) {
+    uint32_t v = totp(secret, sizeof(secret) - 1, vec[i].t, 8);
+    if (v != vec[i].want) {
+      ok = false;
+      Serial.print("OTP SELFTEST FAIL counter=");
+      Serial.println((unsigned long)(vec[i].t / 30));
+    }
+  }
+  Serial.println(ok ? "OTP SELFTEST PASS" : "OTP SELFTEST FAIL");
+}
+#endif
 
 // ---------------------------------------------------------------------
 // Binary frame parser (Serial1, 8N1)
@@ -224,10 +331,22 @@ void setup() {
   Mouse.begin();
   Consumer.begin();
 
+#if OTP_ENABLED
+  otp_load_secret();
+#if OTP_SELFTEST
+  otp_selftest();
+#endif
+#endif
+
   Serial1.begin(BAUD);   // UART pins 0/1 <- Pico GPIO0
 }
 
 void loop() {
+#if OTP_ENABLED
+  // Provisioning commands on ttyACM0 (CDC). Non-blocking.
+  otp_service_cdc();
+#endif
+
   // Non-blocking drain; see the ring-buffer note above.
   while (Serial1.available()) {
     uint8_t c = Serial1.read();
