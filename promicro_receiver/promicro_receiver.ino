@@ -40,64 +40,64 @@
 static const uint32_t BAUD = 115200;
 
 // ---------------------------------------------------------------------
-// OTP (TOTP typing). Only the receiver on the computer that needs the OTP
+// OTP (HOTP typing). Only the receiver on the computer that needs the OTP
 // sets OTP_ENABLED=1; the other receiver keeps 0 = stock behavior.
 //   OTP_DIGITS   - token length typed (6 = RFC standard)
-//   OTP_DEFAULT_SECRET_B32 - fallback secret if EEPROM is unprovisioned
-//                            (RFC 4648 base32, A-Z2-7)
-//   Provision at runtime with  s <base32>  over ttyACM0 (CDC).
+//   OTP_SECRET_B32 - the secret, baked into firmware Flash at compile time
+//                    (RFC 4648 base32, A-Z2-7). WORTH REMEMBERING: anyone
+//                    who can reflash/read the chip can get it, and there is
+//                    NO runtime provisioning - set it before flashing.
+//   OTP_PREAMBLE - text typed BEFORE the digits (e.g. "ga:"), "" = none.
+//   Trigger on this receiver: PrintScreen types the HOTP digits;
+//   Shift+PrintScreen types only the preamble. Both the keycode and the
+//   Shift modifier are swallowed (never forwarded to the PC), and the code
+//   is typed with a non-blocking state machine.
+//   HOTP (RFC 4226): counter-based. The 32-bit counter only ever increments
+//   and is persisted to EEPROM after every typed code; there is NO clock and
+//   NO time sync. Server desync is repaired server-side per RFC 4226 7.4
+//   look-ahead resync.
 //   Boot self-test verifies RFC 6238 vectors when OTP_SELFTEST=1.
 // ---------------------------------------------------------------------
 #define OTP_ENABLED 1
 #define OTP_DIGITS 6
-#define OTP_DEFAULT_SECRET_B32 "JBSWY3DPEHPK3PXP"
+#define OTP_SECRET_B32 "JBSWY3DPEHPK3PXP"  // Change with your HOTP secret
+#define OTP_PREAMBLE "preamb"              //  Something that will be printed with Shift+PrintScr
+                                 // "" = none. ASCII only, US layout, max 18 chars.
 #define OTP_SELFTEST 1
 
 #include <string.h>
 #if OTP_ENABLED
 #include <EEPROM.h>
+#include <avr/pgmspace.h>
 #include "totp.h"
 
-// --- secret storage (EEPROM: 'OTP' magic + len + raw bytes) ---
+// --- HOTP (RFC 4226) counter state. No clock, no time sync, no RTC, no
+// escape hatch: the counter ONLY ever increments, and after each typed
+// code it is advanced + persisted to EEPROM. Server desync is repaired
+// server-side per RFC 4226 7.4 (the verifier tries successive counters in
+// a look-ahead window and re-syncs on the match); the device just goes up.
+static uint32_t otp_counter = 0;            // current HOTP counter
+static const uint16_t HOTP_CTR_EEPROM_ADDR = 24;   // after secret (0..23)
+static const uint8_t  HOTP_CTR_EEPROM_LEN = 4;
+
+// --- secret: baked into firmware Flash, decoded into RAM once at boot.
+//     No runtime provisioning; there is no read-back from the MCU. ---
 static uint8_t otp_secret[20];
 static uint8_t otp_secret_len = 0;
 
-static void otp_use_default_secret(void) {
-  otp_secret_len = (uint8_t)base32_decode(OTP_DEFAULT_SECRET_B32,
-                     strlen(OTP_DEFAULT_SECRET_B32), otp_secret, sizeof(otp_secret));
-}
-
 static void otp_load_secret(void) {
-  if (EEPROM.read(0) == 'O' && EEPROM.read(1) == 'T' && EEPROM.read(2) == 'P') {
-    uint8_t n = EEPROM.read(3);
-    if (n >= 1 && n <= sizeof(otp_secret)) {
-      for (uint8_t i = 0; i < n; i++) otp_secret[i] = EEPROM.read(4 + i);
-      otp_secret_len = n;
-      Serial.print("OTP secret: EEPROM (");
-      Serial.print(otp_secret_len);
-      Serial.println(" bytes)");
-      return;
-    }
-  }
-  otp_use_default_secret();
-  Serial.print("OTP secret: default (");
+  static const char b32[] PROGMEM = OTP_SECRET_B32;
+  char buf[sizeof(b32)];
+  memcpy_P(buf, b32, sizeof(b32));
+  otp_secret_len = (uint8_t)base32_decode(buf, strlen(buf), otp_secret, sizeof(otp_secret));
+  Serial.print("OTP secret: flash (");
   Serial.print(otp_secret_len);
   Serial.println(" bytes)");
 }
 
-static void otp_store_secret(const uint8_t *bytes, uint8_t n) {
-  EEPROM.write(0, 'O'); EEPROM.write(1, 'T'); EEPROM.write(2, 'P');
-  EEPROM.write(3, n);
-  for (uint8_t i = 0; i < n; i++) EEPROM.write(4 + i, bytes[i]);
-  for (uint8_t i = n; i < sizeof(otp_secret); i++) EEPROM.write(4 + i, 0);
-  memcpy(otp_secret, bytes, n);
-  otp_secret_len = n;
-  Serial.print("OTP secret: provisioned (");
-  Serial.print(n);
-  Serial.println(" bytes)");
-}
-
-// --- CDC command line:  s <base32>  -> provision secret to EEPROM ---
+// --- CDC command line: ignored. HOTP has no clock and no provisioning; the
+//     counter only ever increments. Lines the daemon may send (e.g. the old
+//     't <epoch_s>' time-sync) are drained here and ignored. ---
 static char otp_cmd[80];
 static uint8_t otp_cmd_len = 0;
 
@@ -107,15 +107,7 @@ static void otp_service_cdc(void) {
     if (ch == '\n' || ch == '\r') {
       if (otp_cmd_len > 0) {
         otp_cmd[otp_cmd_len] = '\0';
-        char *p = otp_cmd + 1;               // skip command char
-        while (*p == ' ' || *p == '\t') p++;
-        uint8_t buf[sizeof(otp_secret)];
-        size_t n = base32_decode(p, strlen(p), buf, sizeof(buf));
-        if (n >= 1 && n <= sizeof(otp_secret)) {
-          otp_store_secret(buf, (uint8_t)n);
-        } else {
-          Serial.println("OTP secret: BAD base32");
-        }
+        Serial.println("OTP: no commands (HOTP has no clock)");
       }
       otp_cmd_len = 0;
     } else if (otp_cmd_len < sizeof(otp_cmd) - 1) {
@@ -146,6 +138,163 @@ static void otp_selftest(void) {
   }
   Serial.println(ok ? "OTP SELFTEST PASS" : "OTP SELFTEST FAIL");
 }
+
+// --- non-blocking typing state machine (never delay() in the loop) ---
+enum { OTP_IDLE, OTP_ARM, OTP_HELD, OTP_GAP };
+static const uint32_t OTP_HOLD_MS = 25;             // press duration per char
+static const uint32_t OTP_GAP_MS  = 10;             // pause between chars
+
+typedef struct { uint8_t key; uint8_t shift; } otp_stroke_t;  // HID usage + shift bit
+static uint8_t otp_state = OTP_IDLE;
+static otp_stroke_t otp_strokes[24];                 // preamble chars + digits
+static uint8_t otp_ndigits = 0;                      // total strokes to type
+static uint8_t otp_digit_idx = 0;
+static uint32_t otp_step_ms = 0;                     // when the phase started
+static bool     otp_type_digits = false;             // digit run (vs preamble-only)
+
+// ASCII char -> (HID usage, whether Shift is needed). US layout.
+static uint8_t otp_chr_keycode(uint8_t c, bool *shift) {
+  if (c >= '0' && c <= '9') return (uint8_t)(0x1E + (c - '0'));
+  if (c >= 'a' && c <= 'z') return (uint8_t)(0x04 + (c - 'a'));
+  if (c >= 'A' && c <= 'Z') { *shift = true; return (uint8_t)(0x04 + (c - 'A')); }
+  switch (c) {
+    case ' ': *shift = false; return 0x2C;
+    case '!': *shift = true;  return 0x1E;
+    case '"': *shift = true;  return 0x34;
+    case '#': *shift = true;  return 0x20;
+    case '$': *shift = true;  return 0x21;
+    case '%': *shift = true;  return 0x22;
+    case '&': *shift = true;  return 0x24;
+    case '\'': *shift = false; return 0x34;
+    case '(': *shift = true;  return 0x26;
+    case ')': *shift = true;  return 0x27;
+    case '*': *shift = true;  return 0x25;
+    case '+': *shift = true;  return 0x2E;
+    case ',': *shift = false; return 0x36;
+    case '-': *shift = false; return 0x2D;
+    case '.': *shift = false; return 0x37;
+    case '/': *shift = false; return 0x38;
+    case ':': *shift = true;  return 0x33;
+    case ';': *shift = false; return 0x33;
+    case '<': *shift = true;  return 0x36;
+    case '=': *shift = false; return 0x2E;
+    case '>': *shift = true;  return 0x37;
+    case '?': *shift = true;  return 0x38;
+    case '@': *shift = true;  return 0x1F;
+    case '[': *shift = false; return 0x2F;
+    case '\\': *shift = false; return 0x31;
+    case ']': *shift = false; return 0x30;
+    case '^': *shift = true;  return 0x23;
+    case '_': *shift = true;  return 0x2D;
+    case '`': *shift = false; return 0x35;
+    case '{': *shift = true;  return 0x2F;
+    case '|': *shift = true;  return 0x31;
+    case '}': *shift = true;  return 0x30;
+    case '~': *shift = true;  return 0x35;
+    default:                  return 0;              // unsupported char
+  }
+}
+
+static uint8_t otp_keycode_for_digit(uint8_t d) {   // 0..9 -> HID usage
+  if (d == 0) return 0x27;                          // '0'
+  return (uint8_t)(0x1E + (d - 1));                 // '1'..'9' = 0x1E..0x26
+}
+
+#define OTP_RET_SHIFT  0xE1   // HID usage: left Shift
+#define OTP_RET_LCTRL  0xE0   // HID usage: left Ctrl
+#define OTP_RET_RCTRL  0xE4   // HID usage: right Ctrl
+#define OTP_RET_RSHIFT 0xE5   // HID usage: right Shift
+
+static void otp_press_stroke(uint8_t i) {
+  if (otp_strokes[i].shift) Keyboard.press((KeyboardKeycode)OTP_RET_SHIFT);
+  Keyboard.press((KeyboardKeycode)otp_strokes[i].key);
+}
+
+static void otp_release_stroke(uint8_t i) {
+  Keyboard.release((KeyboardKeycode)otp_strokes[i].key);
+  if (otp_strokes[i].shift) Keyboard.release((KeyboardKeycode)OTP_RET_SHIFT);
+}
+
+// digits -> if 0 print the preamble, otherwise print the digits
+static bool otp_trigger(int digits) {
+  if (otp_state != OTP_IDLE) {
+    Serial.println("OTP busy");
+    return false;
+  }
+  uint32_t code = hotp(otp_secret, otp_secret_len, otp_counter, OTP_DIGITS);
+
+  // Build the full stroke list: preamble (OTP_PREAMBLE) or
+  // digits. Each stroke carries its own Shift flag, so punctuation in the
+  // preamble types cleanly (US layout).
+  uint8_t n = 0;
+  otp_type_digits = (digits != 0);
+  if (!digits) {
+    for (const char *p = OTP_PREAMBLE; *p && n < sizeof(otp_strokes)/sizeof(otp_strokes[0]); p++) {
+      bool shift = false;
+      uint8_t usage = otp_chr_keycode((uint8_t)*p, &shift);
+      if (usage) {
+        otp_strokes[n].key = usage;
+        otp_strokes[n].shift = shift ? 1 : 0;
+        n++;
+      }
+    }
+    otp_ndigits = (uint8_t)(n);
+  } else {
+    for (uint8_t i = OTP_DIGITS; i-- > 0;) {
+      otp_strokes[n + i].key = otp_keycode_for_digit((uint8_t)(code % 10));
+      otp_strokes[n + i].shift = 0;
+      code /= 10;
+    }
+    otp_ndigits = (uint8_t)(OTP_DIGITS);
+  }
+
+  otp_digit_idx = 0;
+  // A trigger modifier may already have been forwarded to the PC (e.g. a
+  // frame with just Shift before the PrintScreen). Release all trigger mods
+  // NOW so the first stroke is never pressed while the OS still holds one.
+  Keyboard.release((KeyboardKeycode)OTP_RET_SHIFT);
+  Keyboard.release((KeyboardKeycode)OTP_RET_RSHIFT);
+  Keyboard.release((KeyboardKeycode)OTP_RET_LCTRL);
+  Keyboard.release((KeyboardKeycode)OTP_RET_RCTRL);
+  otp_state = OTP_ARM;              // press stroke 0 on the next service() tick,
+  otp_step_ms = millis();           // after the swallow/release reports flush
+  Serial.println("OTP typed");
+  return true;
+}
+
+static void otp_service(void) {
+  if (otp_state == OTP_IDLE) return;
+  uint32_t now = millis();
+
+  if (otp_state == OTP_ARM) {
+    otp_press_stroke(0);
+    otp_state = OTP_HELD;
+    otp_step_ms = now;
+  } else if (otp_state == OTP_HELD && now - otp_step_ms >= OTP_HOLD_MS) {
+    otp_release_stroke(otp_digit_idx);
+    otp_state = OTP_GAP;
+    otp_step_ms = now;
+  } else if (otp_state == OTP_GAP && now - otp_step_ms >= OTP_GAP_MS) {
+    Serial.print("OTP step ");
+    Serial.print((int)(otp_digit_idx + 1));
+    Serial.print('/');
+    Serial.println((int)otp_ndigits);
+    otp_digit_idx++;
+    if (otp_digit_idx >= otp_ndigits) {
+      otp_state = OTP_IDLE;
+      if (otp_type_digits) {   // only a digit run consumes an OTP
+        otp_counter++;
+        for (uint8_t i = 0; i < HOTP_CTR_EEPROM_LEN; i++)
+          EEPROM.write(HOTP_CTR_EEPROM_ADDR + i,
+                       (uint8_t)(otp_counter >> (8 * i)));
+      }
+    } else {
+      otp_press_stroke(otp_digit_idx);
+      otp_state = OTP_HELD;
+      otp_step_ms = now;
+    }
+  }
+}
 #endif
 
 // ---------------------------------------------------------------------
@@ -158,6 +307,44 @@ static uint8_t g_inst;            // dispatch key (HID instance)
 static uint8_t g_len;             // expected payload length
 static uint8_t g_rep[64];         // raw report bytes
 static uint8_t g_nb;              // payload bytes received so far
+
+#if OTP_ENABLED
+#define OTP_MOD_LSHIFT 0x02
+#define OTP_MOD_RSHIFT 0x20
+#define OTP_KEY_PRINTSCREEN 0x46
+
+// Scan a keyboard report for the PrintScreen trigger. Plain PrintScreen
+// fires the digits; Shift+PrintScreen fires the preamble. The PrintScreen
+// keycode AND the Shift modifier are swallowed from the frame reaching the
+// PC (so digits type clean, without Shift combos and without triggering a
+// screenshot). A chord refused because OTP is busy forwards PrintScreen.
+static bool otp_chord_held = false;
+
+static void otp_scan_kb(void) {
+  bool shift = (g_rep[0] & (OTP_MOD_LSHIFT | OTP_MOD_RSHIFT)) != 0;
+  bool prtscr = false;
+  for (uint8_t i = 2; i < 6 + 2; i++) {
+    if (g_rep[i] == OTP_KEY_PRINTSCREEN) { prtscr = true; break; }
+  }
+
+  if (prtscr && shift) {
+    // preamble
+    if (!otp_chord_held) otp_chord_held = otp_trigger(0);
+  } else if (prtscr) {
+    // digits
+    if (!otp_chord_held) otp_chord_held = otp_trigger(1);
+  } else {
+    otp_chord_held = false;
+  }
+
+  if (otp_chord_held || otp_state != OTP_IDLE) {
+    g_rep[0] &= (uint8_t)~(OTP_MOD_LSHIFT | OTP_MOD_RSHIFT);   // swallow Shift
+    for (uint8_t i = 2; i < 6 + 2; i++) {
+      if (g_rep[i] == OTP_KEY_PRINTSCREEN) g_rep[i] = 0;       // swallow PrintScreen
+    }
+  }
+}
+#endif
 
 // ---------------------------------------------------------------------
 // Keyboard (instance 0): 8 bytes  [mod 0, reserved, k0..k5]
@@ -301,6 +488,9 @@ static void dispatch(void) {
   switch (g_inst) {
     case 0:                          // keyboard
       if (g_len >= 8) {
+#if OTP_ENABLED
+        otp_scan_kb();               // swallow '.', and L-Ctrl while typing
+#endif
         emit_kb();
         print_kb_event();
       }
@@ -333,6 +523,11 @@ void setup() {
 
 #if OTP_ENABLED
   otp_load_secret();
+  otp_counter = 0;
+  for (uint8_t i = 0; i < HOTP_CTR_EEPROM_LEN; i++)
+    otp_counter |= ((uint32_t)EEPROM.read(HOTP_CTR_EEPROM_ADDR + i)) << (8 * i);
+  Serial.print("HOTP counter: ");
+  Serial.println((unsigned long)otp_counter);
 #if OTP_SELFTEST
   otp_selftest();
 #endif
@@ -343,8 +538,10 @@ void setup() {
 
 void loop() {
 #if OTP_ENABLED
-  // Provisioning commands on ttyACM0 (CDC). Non-blocking.
+  // Provisioning/time-sync commands on ttyACM0 (CDC). Non-blocking.
   otp_service_cdc();
+  // Advance the non-blocking HOTP typing state machine.
+  otp_service();
 #endif
 
   // Non-blocking drain; see the ring-buffer note above.

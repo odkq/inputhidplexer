@@ -80,6 +80,7 @@ static uint32_t last_arm = 0;
 
 void loop() {
   USBHost.task();
+  sw_service();
 
   // Keep one interrupt-IN read armed on every mounted interface. Never run
   // this until the device is fully configured, and never arm from the mount
@@ -159,6 +160,75 @@ static const uint8_t MOD_RCTRL = 0x10;
 
 static bool prev_rctrl = false;    // was R-Ctrl down in the previous frame?
 static bool chord_seen = false;    // R-Ctrl shared a frame with another key
+// ---------------------------------------------------------------------
+// Pre-switch chord (non-blocking FSM, serviced from loop()).
+// A solo Right-Ctrl RELEASE no longer flips immediately. In this exact
+// order on the ACTIVE machine:
+//   1) SW_REPORT_CLEAR  - guarantee no modifier is stranded (the real
+//      R-Ctrl release frame is swallowed by the sweep, so this is the
+//      signal that keeps Ctrl from staying down forever);
+//   2) SW_REPORT_CTRLCOM - hold Control+comma (sway on both machines
+//      binds Control+comma to flip the monitor over DDC, so the screen
+//      follows the channel *before* the channel actually moves);
+//   3) release, settle, then flip the channel.
+// A watchdog forces CLEAR+flip, so a modifier can never be stranded.
+// ---------------------------------------------------------------------
+enum { SW_IDLE, SW_CLEAR, SW_CHORD, SW_CC_CT, SW_CC_GAP };
+static uint8_t  sw_state   = SW_IDLE;
+static uint32_t sw_step_ms = 0;
+static const uint8_t SW_STX            = 0x81;
+static const uint8_t SW_REPORT_CLEAR[8]   = { 0,0,0,0,0,0,0,0 };
+static const uint8_t SW_REPORT_CTRLCOM[8] = { 0x01,0,0x36,0,0,0,0,0 };
+static const uint32_t SW_CC_HOLD_MS   = 60;
+static const uint32_t SW_CC_GAP_MS    = 40;
+static const uint32_t SW_WATCHDOG_MS  = 500;
+static void sw_emit(uint8_t instance, const uint8_t *rep) {
+  Stream &s = *out;
+  s.write(SW_STX);
+  s.write(instance);
+  s.write((uint8_t)8);
+  for (uint8_t i = 0; i < 8; i++) s.write(rep[i]);
+  s.flush();
+}
+
+static void sw_service(void) {
+  if (sw_state == SW_IDLE) return;
+  uint32_t now = millis();
+  if (now - sw_step_ms >= SW_WATCHDOG_MS) {
+    sw_emit(0, SW_REPORT_CLEAR);
+    out = (out == &Serial1) ? &Serial2 : &Serial1;
+    sw_state = SW_IDLE;
+    return;
+  }
+  switch (sw_state) {
+    case SW_CLEAR:
+      sw_emit(0, SW_REPORT_CLEAR);
+      sw_state   = SW_CHORD;
+      sw_step_ms = now;
+      break;
+    case SW_CHORD:
+      sw_emit(0, SW_REPORT_CTRLCOM);
+      sw_state   = SW_CC_CT;
+      sw_step_ms = now;
+      break;
+    case SW_CC_CT:
+      if (now - sw_step_ms >= SW_CC_HOLD_MS) {
+        sw_emit(0, SW_REPORT_CLEAR);
+        sw_state   = SW_CC_GAP;
+        sw_step_ms = now;
+      }
+      break;
+    case SW_CC_GAP:
+      if (now - sw_step_ms >= SW_CC_GAP_MS) {
+        out = (out == &Serial1) ? &Serial2 : &Serial1;
+        sw_state = SW_IDLE;
+      }
+      break;
+    default:
+      sw_state = SW_IDLE;
+      break;
+  }
+}
 
 // Route one received report to the selected channel.
 static void forward(uint8_t dev_addr, uint8_t instance,
@@ -188,16 +258,20 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
       // Right-Ctrl held: remember if it was ever combined with another key.
       if (any_key) chord_seen = true;
     } else {
-      // Right-Ctrl up: toggle only for a solo press (release edge).
+      // Solo Right-Ctrl up: don't flip yet. Start the pre-switch FSM;
+      // it clears -> types Control+comma -> flips (never blocks).
       if (prev_rctrl && !chord_seen) {
-        out = (out == &Serial1) ? &Serial2 : &Serial1;
+        sw_state   = SW_CLEAR;      // guarantee modifiers are all up
+        sw_step_ms = millis();      // start the shot clock
       }
-      chord_seen = false;   // fresh R-Ctrl press may start clean
+      chord_seen = false;
     }
     prev_rctrl = rctrl;
   }
 
-  forward(dev_addr, instance, report, len);
+  if (!(instance == 0 && len == 8 && sw_state != SW_IDLE)) {
+    forward(dev_addr, instance, report, len);
+  }
 
   if (tuh_hid_receive_ready(dev_addr, instance)) {
     tuh_hid_receive_report(dev_addr, instance);
